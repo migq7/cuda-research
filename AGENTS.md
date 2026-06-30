@@ -6,6 +6,31 @@
 - **No physical GPU** — all analysis is done via *offline* disassembly (PTX, SASS, cubin). Never try to run kernels.
 - NVCC at `/usr/local/cuda/bin/nvcc`, targets `sm_90`.
 
+**First action on every session** — check the actual environment before doing anything:
+
+```bash
+# 1. Is CUDA toolkit present?
+which nvcc && nvcc --version
+
+# 2. Is there a GPU runtime? (determines if we can run kernels)
+nvidia-smi 2>/dev/null || echo "No GPU runtime"
+
+# 3. What SMs does this NVCC support?
+nvcc --list-gpu-arch 2>/dev/null || echo "nvcc does not support --list-gpu-arch"
+
+# 4. What SMs does the GPU hardware support? (if GPU present)
+nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null
+```
+
+The answers determine:
+
+| Capability available | What we can do |
+|---|---|
+| NVCC only, no GPU | Offline disassembly only (PTX/SASS analysis) |
+| NVCC + GPU | Offline analysis + **runtime probes** (compile and run `.cu` files) |
+
+Runtime probes must target the **GPU's actual SM version** (from `nvidia-smi`), not a hardcoded default.
+
 ## What this repo is
 
 A workspace for studying NVIDIA GPU architecture through offline disassembly. New analysis sub-projects may be added over time.
@@ -18,14 +43,74 @@ Three CUDA analysis projects studying how NVCC (CUDA 12.9) compiles PTX/SASS for
 
 No build system, no tests, no lint. Each project has its own `scripts/compile.sh`.
 
+## Adding a new research project
+
+Every new sub-project follows this structure:
+
+```
+NN-project-name/
+├── scripts/
+│   └── compile.sh              # Builds all .cu → .ptx /.sass /.cubin
+├── src/
+│   ├── test_foo.cu             # One probe per concern
+│   └── test_bar.cu
+├── build/                      # Generated (git-ignored)
+│   ├── ptx/
+│   ├── sass/
+│   └── cubin/
+├── runtime-probes/             # Optional: runnable tests (if GPU available)
+│   ├── Makefile                # SM ?= <target>, defaults to GPU's compute cap
+│   └── 01-something/
+│       ├── Makefile
+│       └── probe_xxx.cu
+├── REPORT.md                   # English (written first)
+└── REPORT_zh.md                # Chinese (synced with English)
+```
+
+**Source annotation rule** — every `.cu` file must include a header comment that states:
+
+1. **Target SM version(s)** the test was written for
+2. **Analysis mode**: `Disassembly-only` (offline PTX/SASS) or `Runtime` (runs on hardware)
+3. **What question the test probes**
+
+Template:
+
+```c
+/**
+ * test_xxx.cu
+ *
+ * Target SM: sm_90
+ * Mode: Disassembly-only (compile with scripts/compile.sh, inspect build/sass/)
+ *
+ * Probes: <one-line description of what this test investigates>
+ */
+```
+
+For runtime probes, add:
+
+```c
+/**
+ * probe_xxx.cu
+ *
+ * Target SM: sm_87 (Jetson Orin)
+ * Mode: Runtime (compile with Makefile, run on hardware)
+ *
+ * Probes: <one-line description>
+ */
+```
+
 ## Compiling
 
 ```bash
-# From each project root:
+# Disassembly analysis (from each project root):
 bash scripts/compile.sh
+
+# Runtime probes (from runtime-probes/):
+make          # uses SM from Makefile or environment
+make SM=sm_90 # override SM
 ```
 
-Each script assumes CUDA at `/usr/local/cuda/bin/` and targets `sm_90`. Output goes to `build/ptx/`, `build/sass/`, `build/cubin/`.
+Each compile script assumes CUDA at `/usr/local/cuda/bin/`. Output goes to `build/ptx/`, `build/sass/`, `build/cubin/`.
 
 ## Directory quirks
 
