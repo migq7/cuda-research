@@ -1,0 +1,10 @@
+# Build artifacts
+build/
+
+# Runtime probe binaries
+runtime-probes/*/probe_local_memory
+
+# Editor temp files
+*~
+*.swp
+*.swo
