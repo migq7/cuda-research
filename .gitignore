@@ -1,8 +1,8 @@
 # Build artifacts
 build/
 
-# Runtime probe binaries
-runtime-probes/*/probe_local_memory
+# Runtime probe build output
+runtime-probes/build/
 
 # Editor temp files
 *~

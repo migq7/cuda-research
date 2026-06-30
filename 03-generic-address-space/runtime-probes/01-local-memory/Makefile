@@ -3,15 +3,18 @@
 
 SM   ?= sm_87
 NVCC ?= /usr/local/cuda/bin/nvcc
-TARGET = probe_local_memory
+TARGET = ../build/probe_local_memory
 
 all: $(TARGET)
 
-$(TARGET): probe_local_memory.cu
+../build:
+	mkdir -p $@
+
+$(TARGET): probe_local_memory.cu | ../build
 	$(NVCC) -arch=$(SM) -O3 -o $@ $<
 
 run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -f $(TARGET)
+	rm -rf ../build
