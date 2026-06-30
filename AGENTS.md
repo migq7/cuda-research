@@ -135,6 +135,10 @@ When adding new analysis or updating an existing report, always update both.
 - `03-generic-address-space/REPORT.md` — full analysis (English)
 - `03-generic-address-space/REPORT_zh.md` — full analysis (Chinese)
 
+## Git
+
+**Never commit or push unless explicitly asked.** Only run `git commit` or `git push` when the user instructs you to do so. After committing, do not push automatically — wait for the user to request it.
+
 ## PTX inline asm notes
 
 - `lop3.b64` and `shf.l.wrap.*` are **not** valid PTX instructions in CUDA 12.9 sm_90. Use `and.b64`/`or.b64` and `shl.b64`/`shr.b64` instead.

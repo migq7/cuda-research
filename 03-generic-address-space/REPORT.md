@@ -13,6 +13,7 @@
 2. [Generic Pointer Bit Layout](#2-generic-pointer-bit-layout)
    - 2.1. [Space Identification: `QSPC.E.*` Instructions](#21-space-identification-qspce-instructions)
    - 2.2. [64-bit Generic Pointer Structure](#22-64-bit-generic-pointer-structure)
+   - 2.3. [Address Space Conversion Rules](#23-address-space-conversion-rules)
 3. [Window Layout in Generic Address Space](#3-window-layout-in-generic-address-space)
    - 3.1. [Shared Memory Window](#31-shared-memory-window)
    - 3.2. [Local Memory Window](#32-local-memory-window)
@@ -48,6 +49,7 @@
    - 8.3. [The `QSPC.E.G` Dual-Check Design](#83-the-qspceg-dual-check-design)
 9. [Test File Inventory](#9-test-file-inventory)
 10. [Open Questions](#10-open-questions)
+11. [Runtime Verification (sm_87 Jetson Orin)](#11-runtime-verification-sm_87-jetson-orin)
 
 ---
 
@@ -132,7 +134,7 @@ All three QSPC variants read the **full 64-bit pointer** from a register pair an
 QSPC.E.S P0, RZ, [R18]    ; P0 = 1 if {R18,R19} ∈ shared space
 ```
 
-Judgment mechanism: The upper 32 bits of a shared generic pointer carry `SR_SWINHI`, which encodes the CTA's window ID via `(CgaCtaId << 24) | 0x400`. The shared space occupies a well-defined, contiguous region in the high portion of the generic address space — one 16 MB window per CTA. QSPC.E.S likely compares the upper bits against the hardware's known shared-window range boundaries in a single cycle. No additional constant-bank lookup is needed because the shared window boundaries are fixed by the architecture (number of CTAs × 16 MB), not by the kernel.
+Judgment mechanism: The upper 32 bits of a shared generic pointer carry `SR_SWINHI`, a **fixed shared-space tag** — runtime evidence on sm_87 confirms this is a constant value (0x0001ffff on that architecture) that does NOT vary per CTA. The per-CTA window isolation is provided by `SR_CgaCtaId` in the ULEA computation, not by `SR_SWINHI`. The shared space occupies a well-defined, contiguous region in the high portion of the generic address space — one 16 MB window per CTA. QSPC.E.S likely compares the upper bits against the hardware's known shared-window range boundaries in a single cycle. No additional constant-bank lookup is needed because the shared window boundaries are fixed by the architecture (number of CTAs × 16 MB), not by the kernel.
 
 **QSPC.E.L — "Is this pointer in the local space range?"**
 
@@ -199,8 +201,80 @@ All three spaces occupy **non-overlapping, architecturally defined ranges**. The
 | Address Space | Upper 32 bits source | Lower 32 bits | cvta.to (extract) | cvta.from (construct) |
 |---------------|---------------------|---------------|-------------------|----------------------|
 | **Global** | same as lower 32 (identity) | physical address | NO-OP (identity) | NO-OP (identity) |
-| **Shared** | `SR_SWINHI` (per-CTA window register) | shared memory offset | NO-OP `MOV` — low 32 bits used directly | `S2R SR_SWINHI` + MOV |
+| **Shared** | `SR_SWINHI` (fixed shared-space tag) | shared memory offset | NO-OP `MOV` — low 32 bits used directly | `S2R SR_SWINHI` + MOV |
 | **Local** | `c[0x0][0x24]:c[0x0][0x20]` window base | stack frame offset | `IADD3 ptr - UR_base` subtraction | `IADD3 ptr + UR_base` addition |
+
+### 2.3. Address Space Conversion Rules
+
+The following table consolidates all space ↔ generic conversion rules, SASS implementations, and runtime cost for each address space on sm_90.
+
+#### Space → Generic (cvta.from)
+
+Constructing a 64-bit generic pointer from a space-specific address:
+
+| Space | PTX | SASS Implementation | Cost |
+|-------|-----|--------------------|------|
+| **Global** | `cvta.global.u64` | Identity NO-OP — same bit pattern | 0 |
+| **Shared** | `cvta.shared.u64` | `S2R SR_SWINHI` (fixed tag → upper 32) + `MOV` offset → lower 32 | 1 special register read |
+| **Local** | `cvta.local.u64` | `IADD3 R0, P0, R1, UR4, RZ` (R1 + c[0x20] → lower 32); `IADD3.X R2, RZ, UR5, RZ, P0` (c[0x24] + carry → upper 32) | 2 integer ALU ops |
+| **Constant** | `cvta.const.u64` | **Not supported** on sm_90 ptxas | — |
+
+#### Generic → Space (cvta.to)
+
+Extracting a space-specific address from a 64-bit generic pointer:
+
+| Space | PTX | SASS Implementation | Cost |
+|-------|-----|--------------------|------|
+| **Global** | `cvta.to.global.u64` | Identity NO-OP | 0 |
+| **Shared** | `cvta.to.shared.u64` | Identity NO-OP — low 32 bits used directly as shared offset | 0 |
+| **Local** | `cvta.to.local.u64` | `IADD3 R3, R6, -UR4, RZ` (gen_lo - c[0x20] → stack offset) | 1 integer ALU op |
+| **Constant** | `cvta.to.const.u64` | **Not supported** on sm_90 ptxas | — |
+
+#### Space-Specific Load/Store (no generic pointer involved)
+
+When the compiler statically knows the address space, it bypasses the generic pointer entirely:
+
+| Op | Space | SASS |
+|----|-------|------|
+| Load | Global | `LDG.E desc[UR][Rx.64], Ry` |
+| Load | Shared | `LDS Ry, [Rx+UR4]` |
+| Load | Local | `LDL Ry, [Rx]` |
+| Load | Constant | `LDC Ry, c[bank][Rx]` |
+| Store | Global | `STG.E desc[UR][Rx.64], Ry` |
+| Store | Shared | `STS [Rx+UR4], Ry` |
+| Store | Local | `STL [Rx], Ry` |
+
+#### Generic Load/Store (runtime space dispatch)
+
+When the compiler **cannot** statically determine the address space, it falls back to the generic path, and the hardware dispatches based on pointer tags at runtime:
+
+| Op | SASS |
+|----|------|
+| Load | `LD.E desc[UR][Rx.64], Ry` |
+| Store | `ST.E desc[UR][Rx.64], Ry` |
+
+#### Summary Diagram
+
+```
+                        cvta.shared   cvta.to.shared
+SHARED offset ◄───────────────────► (SR_SWINHI << 32) | offset
+ (32-bit)        NO-OP / S2R          (64-bit generic)
+
+                        cvta.local    cvta.to.local
+LOCAL  offset ◄───────────────────► window_base + offset
+ (32-bit)       IADD3 add/sub         (64-bit generic)
+
+                        cvta.global   cvta.to.global
+GLOBAL addr  ◄──────────────────────► identity
+ (64-bit)          NO-OP / NO-OP       (64-bit generic)
+
+                        cvta.const    cvta.to.const
+CONSTANT     ◄──────────────────────► NOT SUPPORTED (sm_90)
+ c[bank][off]                            (64-bit generic)
+ (separate addr space — never converted to generic)
+```
+
+> **Note**: On sm_87 (Jetson Orin, runtime-verified), inline asm `cvta.to.shared.u64` produces incorrect output (upper bits polluted). Use `__cvta_generic_to_shared()` builtin instead. `st.shared.u32` via asm works correctly with a valid offset.
 
 ---
 
@@ -222,7 +296,7 @@ ULEA   UR4, UR5, UR4, 0x18     ; UR4 = (UR5 << 24) | UR4  → shared window base
 
 This pattern is **identical across all shared memory sizes** (64B to 48KB) — confirming the window is a virtual construct, not physically sized by the allocation.
 
-`SR_SWINHI` provides the upper 32 bits of the shared generic pointer:
+`SR_SWINHI` provides the upper 32 bits of the shared generic pointer — a **fixed shared-space tag**, not a per-CTA identifier. Runtime evidence on sm_87 confirms this is a constant value (0x0001ffff) that does not vary across blocks:
 ```sass
 S2R   R5, SR_SWINHI     ; upper 32 bits = shared window high register
 MOV   R6, R4             ; lower 32 bits = shared offset
@@ -384,7 +458,7 @@ ULEA  UR4, UR5, UR4, 0x18     ; UR4 = (CgaCtaId << 24) | 0x400
 - The window base `UR4` is stored in a **uniform register** (shared across all threads in a warp) because all threads in the same warp belong to the same CTA
 - The result `UR4 = (CgaCtaId << 24) | 0x400` provides a unique 16 MB virtual address range for this CTA's shared memory
 
-The same mechanism applies to `SR_SWINHI` — the shared window high register that provides the upper 32 bits of the generic shared pointer. It is also a runtime-assigned register encoding the CTA's identity.
+The same mechanism for per-CTA window isolation is handled by `ULEA` using `SR_CgaCtaId` — `SR_SWINHI` (see above) is a fixed tag, not a CTA identifier.
 
 #### 3.6.2. The Address Space as Seen by One CTA
 
@@ -432,7 +506,7 @@ The 64-bit generic pointer carries tag information in its upper 32 bits:
 | Space | Upper 32 bits | Used by `QSPC.E.*`? | Used by space-specific ld/st? |
 |-------|--------------|---------------------|------------------------------|
 | Global | 0 or matching lower 32 (identity) | Yes (`QSPC.E.G`) | Not needed (LDG/STG use descriptor) |
-| Shared | `SR_SWINHI` (CTA-encoded) | Yes (`QSPC.E.S`) | **No** — `STS`/`LDS` use only the 32-bit offset, window is implicit |
+| Shared | `SR_SWINHI` (fixed space tag) | Yes (`QSPC.E.S`) | **No** — `STS`/`LDS` use only the 32-bit offset, window is implicit |
 | Local | `c[0x24]` (window base upper) | Yes (`QSPC.E.L`) | **No** — `STL`/`LDL` use computed stack offset, window is implicit |
 | Generic `ST.E`/`LD.E` | All 64 bits matter | Dispatch source | Hardware decodes tags to route to correct space |
 
@@ -455,9 +529,9 @@ Impossible. `STS [R7], R0` only takes a 32-bit offset — the hardware routes th
 
 **Scenario B: Using `ST.E`/`LD.E` (generic load/store).**
 
-Hypothetically possible at the instruction level, because `ST.E` takes the full 64-bit tagged pointer and dispatches based on the tags. If you manually construct a 64-bit value with another CTA's `SR_SWINHI` in the upper 32 bits and pass it to `ST.E`, the hardware would decode the tags and see "this targets CTA-K's shared space."
+Hypothetically possible at the instruction level, because `ST.E` takes the full 64-bit tagged pointer and dispatches based on the tags. If you manually construct a 64-bit value with the shared-space tag in the upper 32 bits and pass it to `ST.E`, the hardware would decode the tags and see "this targets shared space."
 
-Whether the hardware *permits* this cross-CTA access or *faults* depends on the GPU's protection model, which is not observable from static SASS disassembly. The hardware has all the information needed to detect the violation (the executing CTA's `CgaCtaId` in `SR_CgaCtaId` vs. the pointer's embedded `SR_SWINHI`), but whether it actually checks is implementation-defined.
+Whether the hardware *permits* this cross-CTA access or *faults* depends on the GPU's protection model, which is not observable from static SASS disassembly. The hardware has all the information needed to detect the violation (the executing CTA's `CgaCtaId` vs. the shared window computed by ULEA), but whether it actually checks is implementation-defined.
 
 However, the **compiler's behavior** provides a strong hint: when a `__noinline__` function receives a generic pointer that might target multiple spaces, the compiler emits `ST.E`/`LD.E` (not `STS`/`LDS`). This suggests NVIDIA intends `ST.E`/`LD.E` to be the correct way to handle pointers of unknown provenance — and that the hardware-level dispatch is trusted to route correctly. But the compiler never *deliberately* constructs cross-CTA generic pointers, so this path is not exercised in normal code.
 
@@ -489,7 +563,7 @@ When CTA 0 constructs a generic shared pointer and CTA 1 attempts to dereference
    MOV  R7, R2        ; raw offset from generic pointer
    STS  [R7], R0      ; store to shared[R7]
    ```
-2. The upper 32 bits (containing the window ID = `SR_SWINHI`) are **discarded**
+2. The upper 32 bits (containing the fixed shared-space tag from `SR_SWINHI`) are **discarded**
 3. `STS`/`LDS` instructions use only the offset — the shared memory window is determined **implicitly by the hardware** based on the executing CTA's `CgaCtaId`
 4. No `SR_CgaCtaId` or `SR_SWINHI` is used in the dereference callee
 
@@ -497,16 +571,17 @@ When CTA 0 constructs a generic shared pointer and CTA 1 attempts to dereference
 
 ### 4.3. `SR_SWINHI` — Constructor vs. Dereferencer
 
-The `SR_SWINHI` register is used **only when constructing** a generic shared pointer, not when dereferencing:
+`SR_SWINHI` is a **fixed shared-space tag**, not a per-CTA identifier (runtime-confirmed on sm_87: constant value 0x0001ffff across all blocks). It is read **only when constructing** a generic shared pointer and is never consulted during dereference:
+
 ```sass
 ; CONSTRUCTOR (make_shared_generic_ptr):
-S2R  R4, SR_SWINHI         ; read window high bits
+S2R  R4, SR_SWINHI         ; read fixed shared-space tag
 MOV  R2, RZ                  ; offset = 0
-MOV  R3, R4                  ; return (offset=0, upper=SR_SWINHI)
+MOV  R3, R4                  ; return (offset=0, upper=fixed tag)
 
 ; DEREFERENCER (write_shared_via_generic):
 MOV  R7, R2                  ; take only the low 32 bits → offset
-STS  [R7], R0                ; hardware determines window from CgaCtaId
+STS  [R7], R0                ; hardware determines CTA window from CgaCtaId
 ```
 
 ### 4.4. Visibility Matrix
@@ -675,7 +750,7 @@ The additional probe kernels provide multi-angle confirmation:
 | `k_two_shared_arrays` | Two `__shared__` arrays → **two ULEA** instructions. `arr1` uses `ULEA(Id, 0x400, 0x18)`, `arr2` uses `ULEA(Id, 0x800, 0x18)` — the second array's base is offset by the first array's size (1 KB = 0x400). The shift `0x18` is **identical** for both. |
 | `k_shared_max_48KB` / `k_shared_mid_32KB` / `k_shared_mid_16KB` | Three kernels with 16KB, 32KB, and 48KB shared — **instruction-for-instruction identical SASS**. `UMOV 0x400` and `ULEA 0x18` unchanged at the 48KB boundary. |
 | `k_use_blockidx` | `SR_CTAID.X` (blockIdx) is loaded **separately** from `SR_CgaCtaId` — blockIdx is used only for data values, not for the shared window address. |
-| `k_export_all_generic_ptrs` | `SR_SWINHI` is read via `S2UR` and used as the upper 32 bits of generic shared pointers. The same CTA window identity is available through two paths: ULEA computation (for STS/LDS) and SR_SWINHI read (for generic pointer construction). |
+| `k_export_all_generic_ptrs` | `SR_SWINHI` is read via `S2UR` and used as the upper 32 bits of generic shared pointers (a fixed space tag). CTA window identity comes from ULEA (via `SR_CgaCtaId`) for STS/LDS; SR_SWINHI provides the shared-space tag for generic pointer construction. |
 | `k_builtin_vs_asm_cvta` | When passing generic pointers to `__noinline__` functions, the compiler uses regular-register `LEA` instead of `ULEA` — same formula `(CgaCtaId << 24) + 0x400`, but stored in `R*` registers for the calling convention instead of `UR*` registers for STS/LDS. Both `__cvta_generic_to_shared()` builtin and asm `cvta.to.shared` produce identical `STS [Rx]` patterns in the callee. |
 
 #### 5.3.3. Summary
@@ -722,7 +797,7 @@ The runtime (via `cudaLaunchKernel`) configures the shared memory window size; t
 | `SR_TID.X` | 32 | `S2R` | Thread index within block |
 | `SR_CTAID.X` | 32 | `S2R` | Block index within grid |
 | `SR_CgaCtaId` | 32 | `S2R`, `S2UR` | Cooperative Group Array ID (per-CTA) |
-| `SR_SWINHI` | 32 | `S2R`, `S2UR` | Shared memory window high bits (encodes CTA identity in generic addr) |
+| `SR_SWINHI` | 32 | `S2R`, `S2UR` | Fixed shared-space tag — upper 32 bits of generic shared pointers. Does NOT encode CTA identity (runtime-confirmed: constant across all blocks). |
 
 **`S2R` vs `S2UR`**:
 - `S2R` (Special to Register) → general-purpose `R*` register (per-thread)
@@ -941,7 +1016,7 @@ The `isspacep.global` dual check (tag bits OR range check) suggests that sm_90 s
 
 1. **Actual `c[0x0][0xd0]` threshold value**: The 64-bit constant at `c[0x0][0xd0]` used for the global-space range check cannot be observed statically — it's a runtime value. Its exact value would confirm the global address space range bound in sm_90.
 
-2. **SR_SWINHI encoding**: The internal structure of `SR_SWINHI` — whether it encodes only `CgaCtaId`, or also includes SM ID, partition ID, or other scheduling information — is not determinable from SASS alone.
+2. **SR_SWINHI encoding** — **RESOLVED**: Runtime probe on sm_87 confirms `SR_SWINHI` is a **fixed shared-space tag** (value 0x0001ffff) that does not vary across blocks. It marks the pointer as belonging to shared space but does **not** encode CTA identity. Per-CTA window isolation comes from `SR_CgaCtaId` in the ULEA computation, not from `SR_SWINHI`. Whether the tag value is the same on sm_90 remains unconfirmed (cannot be tested without sm_90 hardware).
 
 3. **`QSPC.E.C` (constant space)**: No `cvta.const` test was successful (ptxas rejected the operand types). The constant space query instruction (`QSPC.E.C` or similar) may exist but remains unverified.
 
@@ -954,4 +1029,54 @@ The `isspacep.global` dual check (tag bits OR range check) suggests that sm_90 s
     
     This cannot be determined from static SASS disassembly. Resolving it requires runtime testing on physical hardware. The architectural implication is significant: if the hardware *does* allow same-SM cross-CTA access via `ST.E`, it means the generic address space provides a flat view of all shared memory windows without CTA-level protection in generic load/store path — only `STS`/`LDS` enforce the implicit isolation.
 
-6. **Consumer of the 0x400 reserved region**: The fixed 0x400 (1 KB) offset at the base of each CTA's shared memory window is confirmed invariant but its consumer remains unknown. `test_mbarrier_shared_reserved.cu` disproved the hypothesis that `cuda::barrier` mbarrier state is stored there — the compiler treats barrier state as ordinary user `__shared__` variables starting at 0x400. Possible explanations include: `__syncthreads()` scratch space, hardware alignment requirements, or a fixed architectural gap with no logical consumer.
+6. **Consumer of the 0x400 reserved region**: The fixed 0x400 (1 KB) offset at the base of each CTA's shared memory window is invariant on sm_90 but its consumer remains unknown. `test_mbarrier_shared_reserved.cu` disproved the mbarrier-storage hypothesis. **Runtime evidence from sm_87 shows shared variables start at offset 0** — the reserved region is present on sm_90 and absent on sm_87, but cannot be assumed to be exclusive to sm_90 without testing other architectures. Possible explanations: hardware alignment, `__syncthreads()` scratch space, or a fixed architectural gap.
+
+---
+
+## 11. Runtime Verification (sm_87 Jetson Orin)
+
+Three runtime probes were executed on Jetson Orin (sm_87) to complement the offline SASS analysis (sm_90). Key findings:
+
+### 11.1. Local Memory — R1 Is Uniform, STL/LDL Hardware Isolation
+
+> **Probe**: `runtime-probes/01-local-memory/probe_local_memory.cu`
+
+| Observation | Result |
+|---|---|
+| R1 across 256 threads | **Uniform** (identical) |
+| `gen_lo`, `gen_hi`, `local_addr` | **Uniform** |
+| T1 reading via T0's generic local ptr | Returns T1's **own** value |
+| Window base (`gen_lo - local_addr`) | Uniform |
+| **Conclusion** | R1 is not per-thread. Thread isolation for local memory is enforced at the `STL`/`LDL` hardware level, not through per-thread address differentiation. |
+
+These findings corrected the initial static-analysis assumption (see Section 3.2) that `c[0x0][0x28]` delivers a per-thread value — it is uniform, and per-thread isolation occurs at the instruction level.
+
+### 11.2. CTA Identity — SR_SWINHI Is a Fixed Tag
+
+> **Probe**: `runtime-probes/02-cta-identity/probe_cta_identity.cu`
+
+| Observation | Result |
+|---|---|
+| `SR_SWINHI` across 8 blocks | **Constant** (0x0001ffff) |
+| `gen_lo` (cvta.shared low 32b) | Constant across blocks (includes window base) |
+| `arr[0]` shared offset (`__cvta_generic_to_shared`) | **0x00000000** (no reserved 0x400 on sm_87) |
+| `arr[0]` value verification (each block writes `bid+tid`) | Value == `blockIdx.x` for all blocks → **CTA isolation confirmed** |
+| **Conclusion** | `SR_SWINHI` is a fixed shared-space tag, not a per-CTA identifier. CTA window isolation comes from `SR_CgaCtaId` in the ULEA computation, not from `SR_SWINHI`. |
+
+The 0x400 reserved region observed on sm_90 is absent on sm_87 — user shared variables start at offset 0.
+
+### 11.3. Address Conversion — Builtin vs. Inline Asm
+
+> **Probe**: `runtime-probes/03-cross-cta-generic/probe_cross_cta_generic.cu`
+
+| Observation | Result |
+|---|---|
+| `__cvta_generic_to_shared(&arr[8])` builtin | Correct (0x20) |
+| asm `cvta.to.shared.u64` → `cvt.u32.u64` | **Incorrect** — upper bits polluted (e.g., 0xb1000020) |
+| asm `st.shared.u32 [offset]` with a valid offset | Works correctly |
+| Cross-CTA generic pointer test | **Not feasible on sm_87** — `cvta.shared` produces identical 64-bit pointers for all blocks |
+| **Conclusion** | On sm_87, inline asm `cvta.to.shared.u64` produces incorrect output. Use `__cvta_generic_to_shared()` builtin instead. `st.shared.u32` via asm is fine when given a valid offset. |
+
+---
+
+**Overall**: Runtime evidence on sm_87 resolved the SR_SWINHI encoding question (Open Question 2, now closed), confirmed that R1 is uniform, and revealed an inline asm quirk specific to cvta.to.shared on this platform. The core architectural model from SASS analysis — window-based addressing, per-CTA/per-thread hardware isolation, fixed space tags — holds across both sm_90 (SASS) and sm_87 (runtime).

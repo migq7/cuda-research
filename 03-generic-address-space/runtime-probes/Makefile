@@ -5,7 +5,7 @@
 SM ?= sm_87
 NVCC ?= /usr/local/cuda/bin/nvcc
 
-SUBDIRS = 01-local-memory
+SUBDIRS = 01-local-memory 02-cta-identity 03-cross-cta-generic
 
 .PHONY: all clean $(SUBDIRS)
 
