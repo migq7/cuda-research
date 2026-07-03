@@ -142,5 +142,5 @@ When adding new analysis or updating an existing report, always update both.
 ## PTX inline asm notes
 
 - `lop3.b64` and `shf.l.wrap.*` are **not** valid PTX instructions in CUDA 12.9 sm_90. Use `and.b64`/`or.b64` and `shl.b64`/`shr.b64` instead.
-- `cvta.const` and `cvta.to.const` are not supported by ptxas on sm_90.
+- `cvta.const` and `cvta.to.const` are **documented in PTX ISA** (since PTX 3.1, sm_20+). However, ptxas may reject them due to a documented restriction: *"does not allow generic pointers to const space variables in programs that contain pointers to constant buffers passed as kernel parameters."* Whether an SASS-level constant-to-generic conversion exists on sm_90 remains unverified.
 - `__isspacep_shared/local/global()` intrinsics compile to `isspacep.*` PTX, which lowers to `QSPC.E.{S,L,G}` SASS instructions.
